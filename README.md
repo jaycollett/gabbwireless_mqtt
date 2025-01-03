@@ -5,6 +5,7 @@
 [![GitHub issues](https://img.shields.io/github/issues-raw/jaycollett/gabbwireless_mqtt)](https://img.shields.io/github/issues-raw/jaycollett/gabbwireless_mqtt)
 [![GitHub pull requests](https://img.shields.io/github/issues-pr/jaycollett/gabbwireless_mqtt)](https://img.shields.io/github/issues-pr/jaycollett/gabbwireless_mqtt)
 [![GitHub](https://img.shields.io/github/license/jaycollett/gabbwireless_mqtt)](https://img.shields.io/github/license/jaycollett/gabbwireless_mqtt)
+
 Simple docker image to run a Python script which will used an "undocumented" API for Gabb Wireless account holders. The script will pull down the device details and publish them to a MQTT broker as configured.
 
 For home assistant users, the script publishes MQTT auto-discovery topics so that your Home Assistant instance will automatically pick up and include the devices and sensors. It also creates a device_tracker device for each device with the GPS coordinates and last GPS update.
