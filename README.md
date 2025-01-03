@@ -17,7 +17,7 @@ None of this would be possible if it were not for this amazing repo and the incr
 **Docker cli**
 
     docker run \
-    - dit \
+    -dit \
     --name gabb-mqtt-publisher \
     --restart unless-stopped \
     -e GABB_USERNAME=<WEBSITE_USERNAME> \
@@ -27,7 +27,7 @@ None of this would be possible if it were not for this amazing repo and the incr
     -e MQTT_USERNAME=<YOUR_MQTT_USER_NAME> \
     -e MQTT_PASSWORD=<YOUR_MQTT_BROKER_PASSWORD> \
     -e REFRESH_RATE=1 \
-    ghcr.io/jaycollett/gabbwireless_mqtt:latestt
+    ghcr.io/jaycollett/gabbwireless_mqtt:latest
 
 **Envioronment Variables ( -e )**
 
