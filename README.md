@@ -26,7 +26,7 @@ None of this would be possible if it were not for this amazing repo and the incr
     -e MQTT_PORT=1883 \
     -e MQTT_USERNAME=<YOUR_MQTT_USER_NAME> \
     -e MQTT_PASSWORD=<YOUR_MQTT_BROKER_PASSWORD> \
-    -e REFRESH_RATE=1 \
+    -e REFRESH_RATE=2 \
     ghcr.io/jaycollett/gabbwireless_mqtt:latest
 
 **Envioronment Variables ( -e )**
