@@ -21,10 +21,19 @@ DEVICE_MANUFACTURER = "Gabb Wireless"
 LOOP_DELAY_SETTING = int(os.getenv("REFRESH_RATE", 1))
 LOOP_DELAY = {1: 300, 2: 600, 3: 1800, 4: 3600}.get(LOOP_DELAY_SETTING, 1800)  # Default to 30 minutes if invalid
 
-PUBLISH_DELAY = float(0.1) # Delay in seconds between publishing each topic
+PUBLISH_DELAY = float(0.1)  # Delay in seconds between publishing each topic
 
 # Global MQTT client
-mqtt_client = mqtt.Client()
+mqtt_client = mqtt.Client(protocol=mqtt.MQTTv5)  # Use MQTT version 5
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    print(f"Connected to MQTT broker with result code {rc}")
+
+def on_disconnect(client, userdata, rc):
+    print("Disconnected from MQTT broker.")
+
+def on_message(client, userdata, message):
+    print(f"Received message on topic {message.topic}: {message.payload.decode()}")
 
 def setup_mqtt_client():
     """
@@ -33,6 +42,10 @@ def setup_mqtt_client():
     global mqtt_client
     try:
         mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_disconnect = on_disconnect
+        mqtt_client.on_message = on_message
+
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
         print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
     except Exception as e:
@@ -114,8 +127,10 @@ def generate_homeassistant_discovery_messages(map_data, root_topic="gabb_device"
         "longitude": {"device_class": None, "unit_of_measurement": "°"},
         "latitude": {"device_class": None, "unit_of_measurement": "°"},
         "gpsDate": {"device_class": "timestamp", "unit_of_measurement": None},
-        "deviceStatus": {"device_class": "connectivity", "unit_of_measurement": None},
+        "deviceStatus": {"device_class": None, "unit_of_measurement": None},
         "last_updated": {"device_class": "timestamp", "unit_of_measurement": None},
+        "weight": {"device_class": "weight", "unit_of_measurement": "kg"}
+
     }
 
     discovery_messages = {}
