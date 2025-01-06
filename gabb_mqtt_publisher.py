@@ -127,7 +127,6 @@ def generate_homeassistant_discovery_messages(map_data, root_topic="gabb_device"
         "longitude": {"device_class": None, "unit_of_measurement": "°"},
         "latitude": {"device_class": None, "unit_of_measurement": "°"},
         "gpsDate": {"device_class": "timestamp", "unit_of_measurement": None},
-        "deviceStatus": {"device_class": None, "unit_of_measurement": None},
         "last_updated": {"device_class": "timestamp", "unit_of_measurement": None},
         "weight": {"device_class": "weight", "unit_of_measurement": "kg"}
 
