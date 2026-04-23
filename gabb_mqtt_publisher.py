@@ -1,70 +1,134 @@
+import logging
 import os
+import signal
+import ssl
+import sys
 import time
 from datetime import datetime, timezone
 from gabb import GabbClient
 import json
 import paho.mqtt.client as mqtt
 
-# Configurable Variables from Environment
-GABB_USERNAME = os.getenv("GABB_USERNAME", "default_username")
-GABB_PASSWORD = os.getenv("GABB_PASSWORD", "default_password")
+# Logging setup
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("gabb_mqtt_publisher")
 
-MQTT_BROKER = os.getenv("MQTT_BROKER", "mqtt.example.com")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "mqtt_user")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "mqtt_password")
+
+def _require_env(name: str) -> str:
+    """Return the env var value, or exit with a clear error if missing/empty."""
+    val = os.getenv(name, "").strip()
+    if not val:
+        log.error("Required environment variable %s is not set.", name)
+        sys.exit(2)
+    return val
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Configurable Variables from Environment (fail fast on required creds)
+GABB_USERNAME = _require_env("GABB_USERNAME")
+GABB_PASSWORD = _require_env("GABB_PASSWORD")
+
+MQTT_BROKER = _require_env("MQTT_BROKER")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = _require_env("MQTT_USERNAME")
+MQTT_PASSWORD = _require_env("MQTT_PASSWORD")
+
+MQTT_TLS = _bool_env("MQTT_TLS", False)
+MQTT_CA_CERT = os.getenv("MQTT_CA_CERT", "").strip() or None
+MQTT_TLS_INSECURE = _bool_env("MQTT_TLS_INSECURE", False)
+
+if MQTT_PASSWORD and not MQTT_TLS:
+    log.warning(
+        "MQTT_PASSWORD is set but MQTT_TLS is not enabled; credentials will traverse the network in plaintext."
+    )
 
 DEVICE_MODEL = "Gabb Device"
 DEVICE_MANUFACTURER = "Gabb Wireless"
 
 # Calculate LOOP_DELAY based on environment variable value
-LOOP_DELAY_SETTING = int(os.getenv("REFRESH_RATE", 1))
+LOOP_DELAY_SETTING = int(os.getenv("REFRESH_RATE", "1"))
 LOOP_DELAY = {1: 300, 2: 600, 3: 1800, 4: 3600}.get(LOOP_DELAY_SETTING, 1800)  # Default to 30 minutes if invalid
 
-PUBLISH_DELAY = float(0.1)  # Delay in seconds between publishing each topic
+PUBLISH_DELAY = 0.1  # Delay in seconds between publishing each topic
 
-# Global MQTT client
-mqtt_client = mqtt.Client(protocol=mqtt.MQTTv5)  # Use MQTT version 5
+# Global MQTT client (paho-mqtt v2 API)
+mqtt_client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    protocol=mqtt.MQTTv5,
+)
 
-def on_connect(client, userdata, flags, rc, properties=None):
-    print(f"Connected to MQTT broker with result code {rc}")
 
-def on_disconnect(client, userdata, rc):
-    print("Disconnected from MQTT broker.")
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    log.info("Connected to MQTT broker (reason_code=%s).", reason_code)
+
+
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
+    log.warning("Disconnected from MQTT broker (reason_code=%s).", reason_code)
+
 
 def on_message(client, userdata, message):
-    print(f"Received message on topic {message.topic}: {message.payload.decode()}")
+    log.debug("Received message on topic %s: %s", message.topic, message.payload.decode(errors="replace"))
+
 
 def setup_mqtt_client():
     """
-    Setup and connect the MQTT client.
+    Setup and connect the MQTT client, and start its network loop.
     """
     global mqtt_client
-    try:
-        mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-        mqtt_client.on_connect = on_connect
-        mqtt_client.on_disconnect = on_disconnect
-        mqtt_client.on_message = on_message
+    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_disconnect = on_disconnect
+    mqtt_client.on_message = on_message
 
-        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
-    except Exception as e:
-        print(f"Failed to connect to MQTT broker: {e}")
-        raise e
+    if MQTT_TLS:
+        try:
+            mqtt_client.tls_set(
+                ca_certs=MQTT_CA_CERT,
+                cert_reqs=ssl.CERT_REQUIRED,
+                tls_version=ssl.PROTOCOL_TLS_CLIENT,
+            )
+            if MQTT_TLS_INSECURE:
+                mqtt_client.tls_insecure_set(True)
+                log.warning("MQTT_TLS_INSECURE=true: peer certificate hostname will not be verified.")
+        except Exception:
+            log.exception("Failed to configure MQTT TLS.")
+            raise
+
+    try:
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        log.info("Connecting to MQTT broker at %s:%s (tls=%s).", MQTT_BROKER, MQTT_PORT, MQTT_TLS)
+    except Exception:
+        log.exception("Failed to connect to MQTT broker.")
+        raise
+
+    # Start the network loop in a background thread so keepalives, reconnects,
+    # and callbacks (on_connect/on_disconnect) fire correctly.
+    mqtt_client.loop_start()
+
 
 def ensure_mqtt_connection():
     """
-    Ensure that the MQTT client is connected.
+    Ensure that the MQTT client is connected; trigger a reconnect if not.
+    The network loop (started in setup_mqtt_client) handles the state machine.
     """
     global mqtt_client
     if not mqtt_client.is_connected():
-        print("MQTT client disconnected. Attempting to reconnect...")
+        log.warning("MQTT client not connected. Attempting reconnect.")
         try:
             mqtt_client.reconnect()
-            print("Reconnected to MQTT broker.")
-        except Exception as e:
-            print(f"Failed to reconnect to MQTT broker: {e}")
-            raise e
+        except Exception:
+            log.exception("Failed to reconnect to MQTT broker.")
+            raise
+
 
 def remove_key_recursive(obj, key_to_remove):
     """
@@ -79,13 +143,14 @@ def remove_key_recursive(obj, key_to_remove):
         for item in obj:
             remove_key_recursive(item, key_to_remove)
 
+
 def generate_mqtt_topics(map_data, root_topic="gabb_device"):
     """
     Generate MQTT topics for devices and their properties.
     """
     devices = map_data.get("data", {}).get("Devices", [])
     if not devices:
-        print("No devices found in the map data.")
+        log.info("No devices found in the map data.")
         return {}
 
     mqtt_topics = {}
@@ -112,13 +177,14 @@ def generate_mqtt_topics(map_data, root_topic="gabb_device"):
 
     return mqtt_topics
 
+
 def generate_homeassistant_discovery_messages(map_data, root_topic="gabb_device"):
     """
     Generate Home Assistant MQTT discovery messages for devices.
     """
     devices = map_data.get("data", {}).get("Devices", [])
     if not devices:
-        print("No devices found in the map data.")
+        log.info("No devices found in the map data.")
         return {}
 
     # Mapping of keys to device_class and unit_of_measurement
@@ -193,6 +259,7 @@ def generate_homeassistant_discovery_messages(map_data, root_topic="gabb_device"
 
     return discovery_messages
 
+
 def publish_to_mqtt_broker(mqtt_topics, discovery_messages, delay=0.1):
     """
     Publish MQTT topics and Home Assistant discovery messages to the broker.
@@ -204,68 +271,93 @@ def publish_to_mqtt_broker(mqtt_topics, discovery_messages, delay=0.1):
     for topic, payload in discovery_messages.items():
         try:
             mqtt_client.publish(topic, json.dumps(payload))
-            print(f"Published Home Assistant discovery message to {topic}")
+            log.debug("Published Home Assistant discovery message to %s", topic)
             time.sleep(delay)
-        except Exception as e:
-            print(f"Failed to publish Home Assistant discovery message to {topic}: {e}")
+        except Exception:
+            log.exception("Failed to publish Home Assistant discovery message to %s", topic)
 
     # Publish regular MQTT topics
     for topic, value in mqtt_topics.items():
         try:
             mqtt_client.publish(topic, json.dumps(value) if isinstance(value, (dict, list)) else str(value))
-            print(f"Published to {topic}")
+            log.debug("Published to %s", topic)
             time.sleep(delay)
-        except Exception as e:
-            print(f"Failed to publish {topic}: {e}")
+        except Exception:
+            log.exception("Failed to publish %s", topic)
+
+
+_shutdown = False
+
+
+def _handle_signal(signum, frame):
+    global _shutdown
+    log.info("Received signal %s, shutting down.", signum)
+    _shutdown = True
+
 
 def main():
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
         setup_mqtt_client()
-    except Exception as e:
-        print(f"Critical error during MQTT setup: {e}")
+    except Exception:
+        log.exception("Critical error during MQTT setup.")
         return
 
-    while True:
-        print("Starting new iteration...")
-        try:
-            # Initialize Gabb client
-            client = GabbClient(GABB_USERNAME, GABB_PASSWORD)
-            print("Initialized Gabb client.")
-
-            # Fetch map data
-            print("Fetching map data...")
-            map_response = client.get_map()
+    try:
+        while not _shutdown:
+            log.info("Starting new iteration.")
             try:
-                map_data = map_response.json()
-            except Exception as e:
-                print(f"Failed to parse map data: {e}")
-                continue
+                client = GabbClient(GABB_USERNAME, GABB_PASSWORD)
+                log.debug("Initialized Gabb client.")
 
-            # Remove all "SafeZone" entries from the data
-            remove_key_recursive(map_data, "SafeZones")
+                log.info("Fetching map data.")
+                map_response = client.get_map()
+                try:
+                    map_data = map_response.json()
+                except Exception:
+                    log.exception("Failed to parse map data.")
+                    # Fall through to sleep and retry
+                    _sleep_interruptible(LOOP_DELAY)
+                    continue
 
-            # Generate MQTT topics
-            print("Processing map data...")
-            mqtt_topics = generate_mqtt_topics(map_data)
+                # Remove all "SafeZone" entries from the data
+                remove_key_recursive(map_data, "SafeZones")
 
-            # Generate Home Assistant discovery messages for all properties
-            print("Generating Home Assistant discovery messages...")
-            discovery_messages = generate_homeassistant_discovery_messages(map_data)
+                log.debug("Processing map data.")
+                mqtt_topics = generate_mqtt_topics(map_data)
 
-            if mqtt_topics or discovery_messages:
-                # Publish to MQTT broker
-                print("Publishing topics to MQTT broker...")
-                publish_to_mqtt_broker(mqtt_topics, discovery_messages, delay=PUBLISH_DELAY)
-        except Exception as e:
-            print(f"Error in iteration: {e}")
+                log.debug("Generating Home Assistant discovery messages.")
+                discovery_messages = generate_homeassistant_discovery_messages(map_data)
 
-        print(f"Iteration complete. Waiting for {LOOP_DELAY} seconds...")
-        time.sleep(LOOP_DELAY)
+                if mqtt_topics or discovery_messages:
+                    log.info("Publishing topics to MQTT broker.")
+                    publish_to_mqtt_broker(mqtt_topics, discovery_messages, delay=PUBLISH_DELAY)
+            except Exception:
+                log.exception("Error in iteration.")
+
+            log.info("Iteration complete. Waiting for %s seconds.", LOOP_DELAY)
+            _sleep_interruptible(LOOP_DELAY)
+    finally:
+        try:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        except Exception:
+            log.exception("Error during MQTT shutdown.")
+
+
+def _sleep_interruptible(seconds: float) -> None:
+    """Sleep in 1s increments so SIGTERM/SIGINT cause prompt shutdown."""
+    end = time.monotonic() + seconds
+    while not _shutdown and time.monotonic() < end:
+        time.sleep(min(1.0, end - time.monotonic()))
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("Script interrupted by user.")
-    except Exception as e:
-        print(f"Unhandled exception: {e}")
+        log.info("Script interrupted by user.")
+    except Exception:
+        log.exception("Unhandled exception.")
