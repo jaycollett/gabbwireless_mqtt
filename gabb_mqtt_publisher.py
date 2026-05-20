@@ -44,13 +44,23 @@ GABB_USERNAME = _require_env("GABB_USERNAME")
 GABB_PASSWORD = _require_env("GABB_PASSWORD")
 
 MQTT_BROKER = _require_env("MQTT_BROKER")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USERNAME = _require_env("MQTT_USERNAME")
 MQTT_PASSWORD = _require_env("MQTT_PASSWORD")
 
 MQTT_TLS = _bool_env("MQTT_TLS", False)
 MQTT_CA_CERT = os.getenv("MQTT_CA_CERT", "").strip() or None
 MQTT_TLS_INSECURE = _bool_env("MQTT_TLS_INSECURE", False)
+
+
+def _mqtt_default_port() -> int:
+    """Default MQTT_PORT to 8883 when TLS is on and no explicit port was set."""
+    explicit = os.getenv("MQTT_PORT", "").strip()
+    if explicit:
+        return int(explicit)
+    return 8883 if MQTT_TLS else 1883
+
+
+MQTT_PORT = _mqtt_default_port()
 
 if MQTT_PASSWORD and not MQTT_TLS:
     log.warning(

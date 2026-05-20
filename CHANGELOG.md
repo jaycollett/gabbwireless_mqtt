@@ -58,3 +58,13 @@
 - `mqtt_client.publish()` return codes are now logged when non-success (queue full, not connected).
 - Container exits with code 1 after 10 consecutive failed iterations, letting Docker/Kubernetes restart policy recover (e.g., from expired creds).
 - Heartbeat file `/tmp/gabb_heartbeat` is touched after each successful iteration. Dockerfile HEALTHCHECK now verifies the heartbeat is recent (mtime within 90 minutes) instead of just verifying imports work.
+
+### Dev / hygiene
+
+- Dockerfile base image bumped to Python 3.13-slim.
+- `__pycache__/` directories removed from the repo; `.gitignore` covers them.
+- Added pytest unit tests under `tests/`. Run with `pip install -r requirements-dev.txt && pytest`.
+- Added `requirements-dev.txt`.
+- MQTT_PORT now auto-defaults to 8883 when `MQTT_TLS=true` and the port isn't set explicitly.
+- README documents `MQTT_TLS`, `MQTT_CA_CERT`, `MQTT_TLS_INSECURE`, `REFRESH_SECONDS`, and the heartbeat-based healthcheck.
+- Updated `actions/checkout` to the current latest pinned major.
