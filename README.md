@@ -45,7 +45,7 @@ None of this would be possible if it were not for this amazing repo and the incr
 | REFRESH_SECONDS    | *(optional)* Poll interval in seconds (minimum 60). Overrides `REFRESH_RATE` when both are set. |
 | REFRESH_RATE       | *(optional)* Legacy 1..4 ladder: 1 = 5 min, 2 = 10 min, 3 = 30 min (default), 4 = 1 hour. Ignored when `REFRESH_SECONDS` is set. |
 
-### Sensor whitelist (0.2.0+)
+### Sensor whitelist (0.3.0+)
 
 To keep Home Assistant's entity list manageable, only the following Gabb device fields are published as individual sensor entities:
 

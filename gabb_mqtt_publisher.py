@@ -13,7 +13,7 @@ import paho.mqtt.client as mqtt
 import requests
 from dateutil import parser as date_parser
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Logging setup
 logging.basicConfig(
