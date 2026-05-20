@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-05-20
 
 A modernization release: HA MQTT discovery brought up to current standards, reliability hardened, and dev tooling added. Existing automations that reference `entity_id` continue to work (all `unique_id` values are byte-identical to 0.1.x). Read the breaking-changes section before upgrading.
 
