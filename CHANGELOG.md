@@ -36,3 +36,25 @@
 - Camel-case entity names were collapsing to single-cap (e.g., "Batterylevel"). Now correctly split ("Battery Level").
 - `gpsDate` is normalized to RFC3339 with timezone before publishing so HA's `timestamp` device class accepts it.
 - Discovery and state messages are now published with `retain=True`. HA no longer loses Gabb entities when it restarts.
+
+### Breaking changes (additional in Group 2)
+
+**Some device fields no longer become standalone sensors.** To reduce HA entity-list clutter, only these fields are now exposed as individual sensors: `batteryLevel`, `latitude`, `longitude`, `gpsDate`, `online`, `phoneNumber`, `imei`, `firmwareVersion`, `deviceType`, `model`. Other fields from the Gabb API (e.g., `appBuild`, `iccid`, `serialNumber`, internal IDs) are still published as JSON attributes on the device_tracker.
+
+*Mitigation:* if you have an automation that referenced a removed sensor by entity_id, change it to read the value as a tracker attribute, e.g. `state_attr('device_tracker.gabb_device_12345', 'appBuild')`. The data is unchanged - only its presentation moved.
+
+### Changed
+
+- `REFRESH_SECONDS` env var added - set the poll interval directly in seconds (min 60). `REFRESH_RATE=1..4` still works for backward compatibility.
+- Removed `PUBLISH_DELAY` artificial sleep - paho-mqtt handles backpressure internally. Each poll iteration is ~4 seconds faster.
+- Pruned transitive deps (`certifi`, `charset-normalizer`, `idna`, `urllib3`, `six`) from requirements.txt. They're still installed transitively via `requests` and `python-dateutil`. Reduces Dependabot noise.
+
+### Reliability
+
+- Reuse `GabbClient` across iterations instead of logging in fresh every poll. Reduces auth load and Gabb-side rate-limit risk.
+- Publish discovery only when needed (on connect, on new device, or on HA `homeassistant/status` birth message) rather than every iteration.
+- Retry `get_map()` with exponential backoff (0s, 5s, 20s) on transient errors before giving up to next poll.
+- Removed manual `reconnect()` call that competed with paho-mqtt's internal loop; configured `reconnect_delay_set(1, 120)` instead.
+- `mqtt_client.publish()` return codes are now logged when non-success (queue full, not connected).
+- Container exits with code 1 after 10 consecutive failed iterations, letting Docker/Kubernetes restart policy recover (e.g., from expired creds).
+- Heartbeat file `/tmp/gabb_heartbeat` is touched after each successful iteration. Dockerfile HEALTHCHECK now verifies the heartbeat is recent (mtime within 90 minutes) instead of just verifying imports work.

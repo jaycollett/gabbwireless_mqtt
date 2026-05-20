@@ -4,11 +4,13 @@ import re
 import signal
 import ssl
 import sys
-import time
+import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from gabb import GabbClient
 import json
 import paho.mqtt.client as mqtt
+import requests
 from dateutil import parser as date_parser
 
 __version__ = "0.2.0"
@@ -59,12 +61,32 @@ DEVICE_MODEL = "Gabb Device"
 DEVICE_MANUFACTURER = "Gabb Wireless"
 ROOT_TOPIC = "gabb_device"
 AVAILABILITY_TOPIC = f"{ROOT_TOPIC}/availability"
+HA_STATUS_TOPIC = "homeassistant/status"
+HEARTBEAT_FILE = Path("/tmp/gabb_heartbeat")
+MAX_CONSECUTIVE_FAILURES = 10
 
-# Calculate LOOP_DELAY based on environment variable value
-LOOP_DELAY_SETTING = int(os.getenv("REFRESH_RATE", "1"))
-LOOP_DELAY = {1: 300, 2: 600, 3: 1800, 4: 3600}.get(LOOP_DELAY_SETTING, 1800)  # Default to 30 minutes if invalid
 
-PUBLISH_DELAY = 0.1  # Delay in seconds between publishing each topic
+def _refresh_interval_seconds() -> int:
+    """Resolve the polling interval, preferring REFRESH_SECONDS when set.
+
+    REFRESH_SECONDS is the explicit, human-friendly knob. REFRESH_RATE
+    (1..4) is kept for backward compatibility with older deployments.
+    """
+    explicit = os.getenv("REFRESH_SECONDS")
+    if explicit:
+        try:
+            value = int(explicit)
+            if value < 60:
+                log.warning("REFRESH_SECONDS=%d below minimum 60; clamping to 60.", value)
+                return 60
+            return value
+        except ValueError:
+            log.warning("REFRESH_SECONDS=%r is not an integer; falling back to REFRESH_RATE.", explicit)
+    legacy = int(os.getenv("REFRESH_RATE", "1"))
+    return {1: 300, 2: 600, 3: 1800, 4: 3600}.get(legacy, 1800)
+
+
+LOOP_DELAY = _refresh_interval_seconds()
 
 # Keys that are slow-moving identity/firmware data and should be filed under
 # the device's "Diagnostic" UI section rather than the main card.
@@ -82,9 +104,37 @@ DIAGNOSTIC_KEYS = {
     "id",
 }
 
+# Whitelist of device fields exposed as individual HA sensor entities. Fields
+# outside this set are still published, but they ride as JSON attributes on the
+# device_tracker rather than cluttering HA's entity list. Keep in sync with the
+# CHANGELOG entry that documents the breaking change.
+SENSOR_FIELDS = {
+    "batteryLevel",
+    "latitude",
+    "longitude",
+    "gpsDate",
+    "online",
+    "phoneNumber",
+    "imei",
+    "firmwareVersion",
+    "deviceType",
+    "model",
+}
+
 # Tracks which devices we've already published an old-discovery cleanup for in
 # this process lifetime, so we only fire the migration sweep once per device.
 _cleaned_legacy_discovery: set[str] = set()
+
+# Tracks which devices we've already published the new device-based discovery
+# for in this process lifetime. Cleared when HA sends the "online" birth
+# message so HA picks discovery back up after a restart, and updated when a
+# new device appears mid-process.
+_discovery_published_for: set[str] = set()
+_discovery_lock = threading.Lock()
+
+# Shutdown coordinator. threading.Event lets us wait()-with-timeout and break
+# out of the sleep immediately on SIGTERM/SIGINT.
+shutdown = threading.Event()
 
 # Global MQTT client (paho-mqtt v2 API)
 mqtt_client = mqtt.Client(
@@ -128,13 +178,38 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
     except Exception:
         log.exception("Failed to publish availability=online on connect.")
 
+    # (Re)subscribe to HA's birth/will topic so we can re-publish discovery
+    # whenever HA restarts. Subscribing in on_connect ensures the subscription
+    # is restored automatically after any reconnect.
+    try:
+        result, _ = client.subscribe(HA_STATUS_TOPIC, qos=0)
+        if result == mqtt.MQTT_ERR_SUCCESS:
+            log.debug("Subscribed to %s for HA birth notifications.", HA_STATUS_TOPIC)
+        else:
+            log.warning("Failed to subscribe to %s (rc=%s).", HA_STATUS_TOPIC, result)
+    except Exception:
+        log.exception("Failed to subscribe to %s.", HA_STATUS_TOPIC)
+
 
 def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
     log.warning("Disconnected from MQTT broker (reason_code=%s).", reason_code)
 
 
 def on_message(client, userdata, message):
-    log.debug("Received message on topic %s: %s", message.topic, message.payload.decode(errors="replace"))
+    try:
+        payload = message.payload.decode(errors="replace")
+    except Exception:
+        payload = "<undecodable>"
+    log.debug("Received message on topic %s: %s", message.topic, payload)
+
+    # HA birth message: when HA comes (back) online it publishes "online" on
+    # homeassistant/status. Clear our discovery cache so the next iteration
+    # republishes device-based discovery and HA repopulates its entity list.
+    if message.topic == HA_STATUS_TOPIC and payload.strip().lower() == "online":
+        with _discovery_lock:
+            n = len(_discovery_published_for)
+            _discovery_published_for.clear()
+        log.info("HA birth message received; cleared discovery cache for %d device(s).", n)
 
 
 def setup_mqtt_client():
@@ -146,6 +221,11 @@ def setup_mqtt_client():
     mqtt_client.on_connect = on_connect
     mqtt_client.on_disconnect = on_disconnect
     mqtt_client.on_message = on_message
+
+    # Let paho's network thread manage reconnection backoff for us. Must be
+    # set BEFORE connect()/loop_start() so the first reconnect attempt picks
+    # up the configured bounds.
+    mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
 
     # Last Will & Testament: if the client drops without a clean disconnect,
     # the broker publishes "offline" on the availability topic so HA can mark
@@ -178,38 +258,68 @@ def setup_mqtt_client():
     mqtt_client.loop_start()
 
 
-def ensure_mqtt_connection():
+def fetch_map_with_retry(client, max_attempts=3, backoff=(0, 5, 20)):
+    """Fetch map data with bounded exponential backoff on transient failures.
+
+    Returns the parsed JSON dict on success, or ``None`` if every attempt
+    failed (the caller falls through to its usual long sleep). Shutdown is
+    honored between attempts so SIGTERM doesn't get blocked behind a retry.
     """
-    Ensure that the MQTT client is connected; trigger a reconnect if not.
-    The network loop (started in setup_mqtt_client) handles the state machine.
-    """
-    global mqtt_client
-    if not mqtt_client.is_connected():
-        log.warning("MQTT client not connected. Attempting reconnect.")
+    last_err = None
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            # Bail early if a shutdown was requested mid-backoff.
+            if shutdown.wait(backoff[attempt]):
+                return None
         try:
-            mqtt_client.reconnect()
-        except Exception:
-            log.exception("Failed to reconnect to MQTT broker.")
-            raise
+            resp = client.get_map()
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            log.warning("get_map attempt %d/%d failed: %s", attempt + 1, max_attempts, e)
+    log.error("get_map failed after %d attempts: %s", max_attempts, last_err)
+    return None
 
 
-def remove_key_recursive(obj, key_to_remove):
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Return True if exc looks like an HTTP 401/403 from the Gabb API.
+
+    These auth failures usually indicate token/credential rot and warrant
+    re-creating the GabbClient on the next iteration to force a fresh login.
     """
-    Recursively traverse a nested dictionary/list structure
-    and remove all occurrences of `key_to_remove`.
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        if resp is not None and resp.status_code in (401, 403):
+            return True
+    return False
+
+
+def _publish_with_rc(client, topic, payload, *, qos=1, retain=True, wait=False, wait_timeout=5):
+    """Publish and log non-success return codes.
+
+    Returns the MQTTMessageInfo so callers can inspect/wait if they need to.
     """
-    if isinstance(obj, dict):
-        obj.pop(key_to_remove, None)
-        for value in obj.values():
-            remove_key_recursive(value, key_to_remove)
-    elif isinstance(obj, list):
-        for item in obj:
-            remove_key_recursive(item, key_to_remove)
+    info = client.publish(topic, payload, qos=qos, retain=retain)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        log.warning("Publish to %s returned rc=%s", topic, info.rc)
+        return info
+    if wait and qos > 0:
+        try:
+            info.wait_for_publish(timeout=wait_timeout)
+        except (ValueError, RuntimeError) as e:
+            log.warning("wait_for_publish on %s failed: %s", topic, e)
+    return info
 
 
 def generate_mqtt_topics(map_data, root_topic=ROOT_TOPIC):
     """
     Generate MQTT topics for devices and their properties.
+
+    Whitelisted sensor fields each get their own topic. Non-sensor fields are
+    bundled into the device's ``location`` payload as JSON attributes so users
+    can still surface them via ``state_attr()`` templates without polluting
+    HA's entity list with one entity per Gabb field.
     """
     devices = map_data.get("data", {}).get("Devices", [])
     if not devices:
@@ -220,10 +330,17 @@ def generate_mqtt_topics(map_data, root_topic=ROOT_TOPIC):
     for device in devices:
         device_id = device.get("id", "unknown")
         topic_prefix = f"{root_topic}/{device_id}"
+
+        # SafeZones is a nested list we never publish. Pop it at the known
+        # location instead of walking the entire tree.
+        device.pop("SafeZones", None)
+
+        # Sensor-eligible fields each get their own topic (preserving the
+        # original gabb_device/<id>/<key> format for entity_id stability).
         for key, value in device.items():
+            if key not in SENSOR_FIELDS:
+                continue
             topic = f"{topic_prefix}/{key}"
-            # HA's timestamp device class requires a tz-aware ISO 8601 string;
-            # normalize gpsDate before publishing or skip it if unparseable.
             if key == "gpsDate":
                 normalized = normalize_timestamp(value)
                 if normalized is None:
@@ -232,16 +349,28 @@ def generate_mqtt_topics(map_data, root_topic=ROOT_TOPIC):
             else:
                 mqtt_topics[topic] = value
 
-        # Add a combined topic for location
+        # Combined location topic doubles as the tracker's json_attributes_topic.
+        # Extra (non-sensor) fields ride along so users can read them as
+        # tracker attributes via state_attr(device_tracker.<id>, 'appBuild').
         if "longitude" in device and "latitude" in device:
-            location_payload = {
+            location_payload: dict = {
                 "latitude": device["latitude"],
-                "longitude": device["longitude"]
+                "longitude": device["longitude"],
             }
             if "gpsDate" in device:
                 normalized_gps = normalize_timestamp(device["gpsDate"])
                 if normalized_gps is not None:
                     location_payload["LastGPSUpdate"] = normalized_gps
+            for k, v in device.items():
+                if k in SENSOR_FIELDS or k in {"latitude", "longitude", "gpsDate"}:
+                    continue
+                # Only carry JSON-serializable scalars / containers; the
+                # location payload is shipped as a single JSON document.
+                try:
+                    json.dumps(v)
+                except (TypeError, ValueError):
+                    continue
+                location_payload[k] = v
             mqtt_topics[f"{topic_prefix}/location"] = location_payload
 
         # Add a current UTC timestamp as a sensor
@@ -308,6 +437,9 @@ def generate_homeassistant_discovery_messages(map_data, root_topic=ROOT_TOPIC):
     sensors and the device tracker as components. unique_ids and
     device.identifiers match the legacy per-entity format byte-for-byte so HA's
     entity registry preserves existing entity_ids across the migration.
+
+    Only fields in ``SENSOR_FIELDS`` produce sensor components. Other fields
+    ride as JSON attributes on the device_tracker.
     """
     devices = map_data.get("data", {}).get("Devices", [])
     if not devices:
@@ -350,6 +482,12 @@ def generate_homeassistant_discovery_messages(map_data, root_topic=ROOT_TOPIC):
         components: dict[str, dict] = {}
 
         for key in device.keys():
+            # Only emit a sensor component for whitelisted fields. Non-sensor
+            # fields are carried on the device_tracker's json_attributes_topic
+            # so the data isn't lost, just not promoted to an entity.
+            if key not in SENSOR_FIELDS:
+                continue
+
             mapping = key_to_device_class.get(key, {})
             device_class = mapping.get("device_class")
             unit_of_measurement = mapping.get("unit_of_measurement")
@@ -416,7 +554,7 @@ def generate_homeassistant_discovery_messages(map_data, root_topic=ROOT_TOPIC):
     return discovery_messages
 
 
-def clear_legacy_discovery_topics(map_data, root_topic=ROOT_TOPIC, delay=PUBLISH_DELAY):
+def clear_legacy_discovery_topics(map_data, root_topic=ROOT_TOPIC):
     """Publish empty retained payloads on the old per-entity discovery topics.
 
     The old format placed each sensor/tracker under its own ``config`` topic.
@@ -448,9 +586,8 @@ def clear_legacy_discovery_topics(map_data, root_topic=ROOT_TOPIC, delay=PUBLISH
             try:
                 # Empty payload + retain=True tells the broker to drop the
                 # retained message entirely (per MQTT spec).
-                mqtt_client.publish(topic, payload="", qos=1, retain=True)
+                _publish_with_rc(mqtt_client, topic, "", qos=1, retain=True)
                 log.debug("Cleared legacy discovery topic %s", topic)
-                time.sleep(delay)
             except Exception:
                 log.exception("Failed to clear legacy discovery topic %s", topic)
 
@@ -458,47 +595,101 @@ def clear_legacy_discovery_topics(map_data, root_topic=ROOT_TOPIC, delay=PUBLISH
         log.info("Cleared %d legacy discovery topics for device %s.", len(topics_to_clear), device_id)
 
 
-def publish_to_mqtt_broker(mqtt_topics, discovery_messages, delay=0.1):
-    """
-    Publish MQTT topics and Home Assistant discovery messages to the broker.
-    All discovery and state messages are published with retain=True so HA
-    recovers cleanly after a restart and slow-moving sensor values (battery,
-    GPS) survive broker reconnections.
+def publish_discovery_for_new_devices(map_data):
+    """Publish device-based discovery for any device not yet seen this run.
+
+    Discovery is retained on the broker, so we only need to publish once per
+    device per process lifetime (re-publish is triggered separately when HA
+    sends the ``homeassistant/status: online`` birth message). Returns the
+    number of devices whose discovery was (re)published.
     """
     global mqtt_client
-    ensure_mqtt_connection()
 
-    # Publish Home Assistant discovery messages
+    discovery_messages = generate_homeassistant_discovery_messages(map_data)
+    if not discovery_messages:
+        return 0
+
+    devices = map_data.get("data", {}).get("Devices", [])
+    new_devices = []
+    for device in devices:
+        device_id = str(device.get("id", "unknown"))
+        with _discovery_lock:
+            already_published = device_id in _discovery_published_for
+        if already_published:
+            continue
+        new_devices.append(device_id)
+
+    if not new_devices:
+        return 0
+
+    log.info("Publishing discovery for %d device(s): %s", len(new_devices), new_devices)
+    published = 0
     for topic, payload in discovery_messages.items():
+        # Map the topic back to a device_id so we only mark the ones we
+        # actually managed to publish.
+        # Topic format: homeassistant/device/{root_topic}_{device_id}/config
         try:
-            mqtt_client.publish(topic, json.dumps(payload), qos=1, retain=True)
-            log.debug("Published Home Assistant discovery message to %s", topic)
-            time.sleep(delay)
+            device_id = topic.split("/")[2].split("_", 2)[-1]
+        except IndexError:
+            device_id = None
+
+        with _discovery_lock:
+            if device_id and device_id in _discovery_published_for:
+                continue
+
+        try:
+            info = _publish_with_rc(
+                mqtt_client,
+                topic,
+                json.dumps(payload),
+                qos=1,
+                retain=True,
+                wait=True,
+                wait_timeout=5,
+            )
+            if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                if device_id:
+                    with _discovery_lock:
+                        _discovery_published_for.add(device_id)
+                published += 1
+                log.debug("Published Home Assistant discovery message to %s", topic)
+            else:
+                log.warning("Discovery publish to %s did not succeed; will retry next iteration.", topic)
         except Exception:
             log.exception("Failed to publish Home Assistant discovery message to %s", topic)
 
-    # Publish regular MQTT topics
+    return published
+
+
+def publish_state_topics(mqtt_topics):
+    """Publish state topics. Returns count of topics whose publish enqueued OK."""
+    global mqtt_client
+
+    if not mqtt_client.is_connected():
+        log.warning("MQTT client not connected; skipping state publish (paho will reconnect in background).")
+        return 0
+
+    succeeded = 0
     for topic, value in mqtt_topics.items():
         try:
-            mqtt_client.publish(
+            info = _publish_with_rc(
+                mqtt_client,
                 topic,
                 json.dumps(value) if isinstance(value, (dict, list)) else str(value),
                 qos=1,
                 retain=True,
             )
-            log.debug("Published to %s", topic)
-            time.sleep(delay)
+            if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                succeeded += 1
+                log.debug("Published to %s", topic)
         except Exception:
             log.exception("Failed to publish %s", topic)
-
-
-_shutdown = False
+    return succeeded
 
 
 def _handle_signal(signum, frame):
-    global _shutdown
     log.info("Received signal %s, shutting down.", signum)
-    _shutdown = True
+    shutdown.set()
 
 
 def main():
@@ -511,64 +702,93 @@ def main():
         log.exception("Critical error during MQTT setup.")
         return
 
+    client: GabbClient | None = None
+    consecutive_failures = 0
+
     try:
-        while not _shutdown:
+        while not shutdown.is_set():
             log.info("Starting new iteration.")
+            iteration_published_anything = False
             try:
-                client = GabbClient(GABB_USERNAME, GABB_PASSWORD)
-                log.debug("Initialized Gabb client.")
+                if client is None:
+                    client = GabbClient(GABB_USERNAME, GABB_PASSWORD)
+                    log.debug("Initialized Gabb client.")
 
                 log.info("Fetching map data.")
-                map_response = client.get_map()
-                try:
-                    map_data = map_response.json()
-                except Exception:
-                    log.exception("Failed to parse map data.")
-                    # Fall through to sleep and retry
-                    _sleep_interruptible(LOOP_DELAY)
-                    continue
+                map_data = fetch_map_with_retry(client)
 
-                # Remove all "SafeZone" entries from the data
-                remove_key_recursive(map_data, "SafeZones")
+                if shutdown.is_set():
+                    break
 
-                # First-run-per-device migration: retract any legacy single-entity
-                # discovery messages still retained on the broker before we
-                # publish the new device-based discovery. Idempotent per device.
-                clear_legacy_discovery_topics(map_data, delay=PUBLISH_DELAY)
+                if map_data is None:
+                    log.warning("Skipping iteration: map data unavailable.")
+                else:
+                    # First-run-per-device migration: retract any legacy single-entity
+                    # discovery messages still retained on the broker before we
+                    # publish the new device-based discovery. Idempotent per device.
+                    clear_legacy_discovery_topics(map_data)
 
-                log.debug("Processing map data.")
-                mqtt_topics = generate_mqtt_topics(map_data)
+                    # Publish discovery only for devices we haven't seen yet (or
+                    # all of them after an HA birth message reset). Retained, so
+                    # this is a no-op for HA after the first publish.
+                    publish_discovery_for_new_devices(map_data)
 
-                log.debug("Generating Home Assistant discovery messages.")
-                discovery_messages = generate_homeassistant_discovery_messages(map_data)
+                    log.debug("Processing map data.")
+                    mqtt_topics = generate_mqtt_topics(map_data)
 
-                if mqtt_topics or discovery_messages:
-                    log.info("Publishing topics to MQTT broker.")
-                    publish_to_mqtt_broker(mqtt_topics, discovery_messages, delay=PUBLISH_DELAY)
+                    if mqtt_topics:
+                        log.info("Publishing topics to MQTT broker.")
+                        n = publish_state_topics(mqtt_topics)
+                        if n > 0:
+                            iteration_published_anything = True
+                            log.debug("Published %d state topic(s).", n)
+            except requests.exceptions.HTTPError as e:
+                log.exception("HTTP error during iteration.")
+                if _is_auth_failure(e):
+                    log.warning("Auth failure detected; recreating GabbClient on next iteration.")
+                    client = None
+            except requests.RequestException:
+                log.exception("Network error during iteration.")
             except Exception:
                 log.exception("Error in iteration.")
 
+            if iteration_published_anything:
+                consecutive_failures = 0
+                try:
+                    HEARTBEAT_FILE.touch()
+                except OSError:
+                    log.exception("Failed to touch heartbeat file %s", HEARTBEAT_FILE)
+            else:
+                consecutive_failures += 1
+                log.warning(
+                    "No state published this iteration (consecutive failures: %d/%d).",
+                    consecutive_failures,
+                    MAX_CONSECUTIVE_FAILURES,
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    log.error(
+                        "Exiting after %d consecutive failed iterations; the orchestrator should restart us.",
+                        consecutive_failures,
+                    )
+                    sys.exit(1)
+
             log.info("Iteration complete. Waiting for %s seconds.", LOOP_DELAY)
-            _sleep_interruptible(LOOP_DELAY)
+            # Event.wait() returns True if the event was set during the wait,
+            # so this is both our sleep and our shutdown check.
+            if shutdown.wait(LOOP_DELAY):
+                break
     finally:
         try:
             # Publish a clean "offline" before disconnecting so HA doesn't
             # have to wait for the LWT timeout on a planned shutdown.
             try:
-                mqtt_client.publish(AVAILABILITY_TOPIC, "offline", qos=1, retain=True)
+                _publish_with_rc(mqtt_client, AVAILABILITY_TOPIC, "offline", qos=1, retain=True, wait=True, wait_timeout=2)
             except Exception:
                 log.exception("Failed to publish availability=offline on shutdown.")
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
         except Exception:
             log.exception("Error during MQTT shutdown.")
-
-
-def _sleep_interruptible(seconds: float) -> None:
-    """Sleep in 1s increments so SIGTERM/SIGINT cause prompt shutdown."""
-    end = time.monotonic() + seconds
-    while not _shutdown and time.monotonic() < end:
-        time.sleep(min(1.0, end - time.monotonic()))
 
 
 if __name__ == "__main__":
