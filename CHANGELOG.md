@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1] - 2026-06-12
+
+- Bundled an integration icon (original artwork) in `custom_components/gabb_wireless/brand/`, served by Home Assistant's local brands proxy on HA 2026.3 and later. On older HA versions the integration works the same, just without the icon.
+- HACS validation now runs without the brands exception.
+
 ## [0.4.0] - 2026-06-12
 
 This release adds a native Home Assistant integration installable through HACS and trims the publisher codebase. The Docker MQTT publisher continues to work exactly as before; the integration is a new, independent way to use the project. Run one or the other, not both (you'd get duplicate devices).

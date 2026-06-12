@@ -31,6 +31,3 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
-          # Remove the brands ignore once jaycollett/gabbwireless_mqtt is
-          # merged into home-assistant/brands.
-          ignore: brands
