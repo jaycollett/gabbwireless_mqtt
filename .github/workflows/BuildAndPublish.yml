@@ -1,7 +1,22 @@
 name: Publish Docker
+# release: covers manually published releases. workflow_call: lets release.yml
+# chain into this directly (releases created with GITHUB_TOKEN don't emit
+# events that trigger other workflows). workflow_dispatch: manual backfill.
 on:
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.4.0)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.4.0)"
+        required: true
+        type: string
 jobs:
   push_to_registry:
     name: Push Docker image to GitHub Packages
@@ -25,5 +40,5 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/jaycollett/${{ github.event.repository.name }}:${{ github.event.release.tag_name }}, ghcr.io/jaycollett/${{ github.event.repository.name }}:latest
+          tags: ghcr.io/jaycollett/${{ github.event.repository.name }}:${{ inputs.tag || github.event.release.tag_name }}, ghcr.io/jaycollett/${{ github.event.repository.name }}:latest
             

@@ -1,8 +1,9 @@
 name: Release
 
-# Creating a release here also triggers BuildAndPublish.yml (release:
-# published), so one version bump in manifest.json drives both the HACS
-# release and the Docker image publish.
+# One version bump in manifest.json drives both the HACS release and the
+# Docker image publish. The docker job calls BuildAndPublish.yml directly
+# because releases created with GITHUB_TOKEN don't emit events that trigger
+# other workflows.
 on:
   push:
     branches: [master]
@@ -15,6 +16,9 @@ jobs:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      created: ${{ steps.check_tag.outputs.exists == 'false' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -42,3 +46,14 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
           generate_release_notes: true
+
+  docker:
+    name: Publish Docker image
+    needs: release
+    if: ${{ needs.release.outputs.created == 'true' }}
+    uses: ./.github/workflows/BuildAndPublish.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      tag: v${{ needs.release.outputs.version }}
