@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.4.0] - 2026-06-12
+
+This release adds a native Home Assistant integration installable through HACS and trims the publisher codebase. The Docker MQTT publisher continues to work exactly as before; the integration is a new, independent way to use the project. Run one or the other, not both (you'd get duplicate devices).
+
+### Added: Home Assistant integration (HACS)
+
+- New custom integration under `custom_components/gabb_wireless/`. Install through HACS as a custom repository, then add it from Settings → Devices & services and sign in with your Gabb credentials. No MQTT broker or container required.
+- UI config flow with credential validation, re-auth prompt on password change, and a configurable polling interval (default 300s, minimum 60s).
+- Per device: GPS device tracker (with extra API fields as attributes), battery sensor with long-term statistics, last-GPS-fix timestamp, online connectivity sensor, and diagnostic sensors for phone number, IMEI, firmware, device type, and model.
+- Self-contained async API client (aiohttp, zero pip dependencies). Diagnostics download redacts credentials, tokens, coordinates, phone numbers, IMEI, ICCID, and serial numbers.
+- Devices added to your Gabb account appear in HA on the next poll without a restart.
+- HACS metadata (`hacs.json`) and CI: hassfest + HACS validation (daily and on every PR), ruff + both test suites on PRs, a version-bump gate, and automatic GitHub releases from the manifest version. Creating a release also triggers the existing Docker image publish, so one version bump ships both channels.
+
+### Publisher improvements
+
+- Vendored `gabb` package trimmed from ~1,000 lines to a single minimal module (auth + `get_map`), with the upstream attribution and license kept. Request timeouts now apply to the map call too (previously missing).
+- Login/refresh responses are status-checked, so bad credentials surface as HTTP 401/403 and trigger the publisher's re-login path instead of an opaque `KeyError`.
+- Configuration moved into a frozen `Config` dataclass built in `main()`. The module no longer reads env vars (or exits) at import time, and the MQTT client is no longer a module-level global.
+- Legacy (pre-0.3.0) discovery migration now follows HA's official `migrate_discovery` procedure: signal migration on the old topics, publish the device-based discovery, then clear the old topics. The previous order cleared first, which could drop entity customizations.
+- Discovery components now include `default_entity_id` so fresh installs get the documented entity ids (e.g. `sensor.gabb_device_12345_batterylevel`). The deprecated `object_id` option is not used.
+- Internal cleanup: discovery generator returns payloads keyed by device id (no more parsing ids back out of topic strings), `generate_mqtt_topics` no longer mutates its input, device ids handled as strings consistently.
+- Test suite grew from 19 to 44 tests, including Gabb client auth/refresh tests and migration-ordering tests.
+
 ## [0.3.0] - 2026-05-20
 
 A modernization release: HA MQTT discovery brought up to current standards, reliability hardened, and dev tooling added. Existing automations that reference `entity_id` continue to work (all `unique_id` values are byte-identical to 0.1.x). Read the breaking-changes section before upgrading.

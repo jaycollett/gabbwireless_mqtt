@@ -1,0 +1,69 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Gabb Wireless",
+        "description": "Sign in with your Gabb parent/guardian account.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        },
+        "data_description": {
+          "username": "The email address or username for your Gabb account.",
+          "password": "The password for your Gabb account."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Gabb Wireless",
+        "description": "The password for {username} is no longer valid. Enter the current password to continue.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password.",
+      "cannot_connect": "Failed to connect to the Gabb service.",
+      "unknown": "Unexpected error. Check the logs for details."
+    },
+    "abort": {
+      "already_configured": "This Gabb account is already configured.",
+      "reauth_successful": "Reauthentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Gabb Wireless options",
+        "data": {
+          "scan_interval": "Update interval"
+        },
+        "data_description": {
+          "scan_interval": "How often to poll the Gabb cloud for device updates, in seconds (minimum 60)."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "gps_date": {
+        "name": "Last GPS fix"
+      },
+      "phone_number": {
+        "name": "Phone number"
+      },
+      "imei": {
+        "name": "IMEI"
+      },
+      "firmware_version": {
+        "name": "Firmware version"
+      },
+      "device_type": {
+        "name": "Device type"
+      },
+      "model": {
+        "name": "Model"
+      }
+    }
+  }
+}
