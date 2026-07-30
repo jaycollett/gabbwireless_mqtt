@@ -14,9 +14,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. v0.4.0)"
-        required: true
+        description: "Release tag to build and publish (leave blank to rebuild the newest tag)"
+        required: false
         type: string
+  # Weekly rebuild. Image staleness, not app code, is what produces most
+  # fixable Critical/High CVEs, so the newest release tag is rebuilt on a
+  # fresh base and repushed. Staggered across repos to spread the load.
+  schedule:
+    - cron: '10 5 * * 2'
 jobs:
   push_to_registry:
     name: Push Docker image to GitHub Packages
@@ -24,6 +29,31 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v6
+        with:
+          # Tags are needed so the scheduled rebuild can find the newest
+          # release to rebuild.
+          fetch-depth: 0
+
+      # release / workflow_call / dispatch all name a tag. The scheduled
+      # rebuild does not, so fall back to the newest tag and rebuild that
+      # exact revision on a current base image.
+      - name: Resolve tag to build
+        id: tag
+        run: |
+          set -eu
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="$(git tag --sort=-v:refname | awk 'NR==1')"
+            if [ -z "$TAG" ]; then
+              echo "::error::No git tags found to rebuild."
+              exit 1
+            fi
+            echo "Rebuilding newest tag ${TAG}"
+          fi
+          git checkout --force --detach "$TAG"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.event.release.tag_name }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -40,5 +70,21 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/jaycollett/${{ github.event.repository.name }}:${{ inputs.tag || github.event.release.tag_name }}, ghcr.io/jaycollett/${{ github.event.repository.name }}:latest
-            
+          tags: ghcr.io/jaycollett/${{ github.event.repository.name }}:${{ steps.tag.outputs.tag }}, ghcr.io/jaycollett/${{ github.event.repository.name }}:latest
+
+      # CVE gate aligned with Harbor's policy (CRITICAL/HIGH, fixable only).
+      # On the weekly scheduled rebuild this reports without failing: a CVE
+      # published since the last release must not block the refresh, because
+      # the refresh is what fixes it. Release runs still fail hard.
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ghcr.io/jaycollett/${{ github.event.repository.name }}:${{ steps.tag.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          format: table
+          exit-code: ${{ github.event_name == 'schedule' && '0' || '1' }}

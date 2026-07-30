@@ -1,0 +1,24 @@
+# Dependabot keeps the base images, actions, and app dependencies moving.
+# Freshness is the dominant driver of fixable Critical/High CVEs in Harbor,
+# so this runs weekly alongside the scheduled image rebuild in the release
+# workflow.
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    open-pull-requests-limit: 5

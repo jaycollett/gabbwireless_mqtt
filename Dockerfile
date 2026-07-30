@@ -1,26 +1,49 @@
-# Use an official Python runtime as a parent image
-FROM python:3.13-slim
+# syntax=docker/dockerfile:1.7
+#
+# Two-stage Alpine build. requests / python-dateutil / paho-mqtt are pure
+# Python, so the runtime layer needs no compilers and carries none of the
+# Debian-slim CVE backlog.
+
+# ---- Stage 1: build the virtualenv ----
+FROM python:3.13-alpine AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apk add --no-cache build-base libffi-dev openssl-dev
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install dependencies first for better layer caching
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---- Stage 2: runtime ----
+FROM python:3.13-alpine
+
+# Unbuffered stdout/stderr so docker logs show output immediately
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+RUN apk add --no-cache libffi openssl
 
 # Set the working directory inside the container
 WORKDIR /app
 
-# Install dependencies first for better layer caching
-COPY requirements.txt /app/requirements.txt
-COPY gabb /app/gabb
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=builder /opt/venv /opt/venv
 
 # Copy the application code
+COPY gabb /app/gabb
 COPY gabb_mqtt_publisher.py /app/gabb_mqtt_publisher.py
 
 # Create a non-root user and drop privileges
-RUN groupadd --system --gid 10001 app \
-    && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \
+RUN addgroup -g 10001 -S app \
+    && adduser -u 10001 -S -G app -H -s /sbin/nologin app \
     && chown -R app:app /app
-USER app
-
-# Unbuffered stdout/stderr so docker logs show output immediately
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+USER 10001:10001
 
 #
 # Environment variables for script
